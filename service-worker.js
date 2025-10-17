@@ -4,7 +4,9 @@ self.addEventListener('install', event => {
         caches.open('duoplanning-cache').then(cache => {
             return cache.addAll([
                 './index.html',
-                './manifest.json'
+                './manifest.json',
+                './icon-192.png',
+                './icon-512.png'
             ]);
         })
     );
