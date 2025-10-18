@@ -39,6 +39,12 @@
     .view{opacity:0;transform:translateY(8px);transition:opacity .25s ease,transform .25s ease}.view.show{opacity:1;transform:translateY(0)}
     @keyframes fadeIn{from{opacity:0}to{opacity:1}}
   </style>
+
+  <!-- Firebase (compat) for easy inline usage) -->
+  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-firestore-compat.js"></script>
+
+  <script src="https://www.gstatic.com/firebasejs/9.22.2/firebase-auth-compat.js"></script>
 </head>
 <body>
 <div class="wrap">
@@ -301,11 +307,94 @@ const STATE_KEY="duoplanning.v42.state";
 let S=JSON.parse(localStorage.getItem(STATE_KEY) || "null")||{name:"",xp:0,energy:3,levelId:"Tecnico",streak:0,lastLoginDay:"",cleared:{},week:{startIso:"",modulesDone:0},dailyDoneOn:"",rank:[{name:"Você",xp:0},{name:"Alice",xp:560},{name:"Bruno",xp:320}]};
 function save(){ localStorage.setItem(STATE_KEY, JSON.stringify(S)); }
 
+
+// ====== Online Leaderboard (Firebase Firestore) ======
+// 1) Preencha sua configuração abaixo (Projeto Firebase → Config Web App)
+const FB_CONFIG = {
+  apiKey: "PASTE_YOUR_API_KEY",
+  authDomain: "PASTE_YOUR_AUTH_DOMAIN",
+  projectId: "PASTE_YOUR_PROJECT_ID",
+  // opcional: storageBucket, messagingSenderId, appId
+};
+let Online = {enabled:false, ready:false, last:[], unsub:null};
+// ====== Online init with Anonymous Auth ======
+Online.status = "offline"; // 'online' | 'offline' | 'loading'
+function updateRankHeader(){
+  const hdr = document.querySelector('[data-i18n="rank_hdr"]');
+  if (!hdr) return;
+  if (Online.enabled && Online.ready) hdr.textContent = (lang==='en'?'Ranking (online)':'Ranking (online)');
+  else if (Online.enabled && !Online.ready) hdr.textContent = (lang==='en'?'Ranking (loading...)':'Ranking (carregando...)');
+  else hdr.textContent = (lang==='en'?'Ranking (local)':'Ranking (local)');
+}
+function OnlineInit(){
+  if (!Online.enabled || Online.ready) { updateRankHeader(); return; }
+  try{
+    Online.status = "loading";
+    updateRankHeader();
+    firebase.auth().onAuthStateChanged((user)=>{
+      if (user) {
+        Online.user = user;
+        onlineUpsertScore();
+        onlineSubscribeLeaderboard(20);
+      } else {
+        firebase.auth().signInAnonymously().catch(e=>console.warn('Anon auth error', e));
+      }
+    });
+    // kickoff auth if not already
+    if (!firebase.auth().currentUser) firebase.auth().signInAnonymously().catch(()=>{});
+  }catch(e){ console.warn("OnlineInit error:", e); }
+}
+
+try{
+  if (FB_CONFIG.apiKey && FB_CONFIG.projectId) {
+    firebase.initializeApp(FB_CONFIG);
+    Online.db = firebase.firestore();
+    Online.enabled = true;
+  }
+}catch(e){ console.warn("Firebase init error:", e); Online.enabled=false; }
+
+function uid(){
+  const KEY="duoplanning.uid";
+  let id=localStorage.getItem(KEY);
+  if(!id){ id = Math.random().toString(36).slice(2) + Date.now().toString(36); localStorage.setItem(KEY,id); }
+  return id;
+}
+
+function onlineUpsertScore(){
+  if(!Online.enabled || !Online.db) return;
+  const L=currentLevel();
+  const docId = uid();
+  Online.db.collection("leaderboard").doc(docId).set({
+    name: S.name || "Jogador",
+    xp: S.xp || 0,
+    levelId: S.levelId || "Tecnico",
+    levelName: L.name,
+    updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+  }, {merge:true}).catch(err=>console.warn("Upsert score error:", err));
+}
+
+function onlineSubscribeLeaderboard(limit=20){
+  if(!Online.enabled || !Online.db) return;
+  if(Online.unsub) try{ Online.unsub(); }catch(e){}
+  Online.unsub = Online.db.collection("leaderboard")
+    .orderBy("xp","desc")
+    .limit(limit)
+    .onSnapshot(snap=>{
+      Online.last = [];
+      snap.forEach(doc=> Online.last.push(doc.data()));
+      Online.ready = true; Online.status = "online";
+      renderDash();  // re-render ranking ao chegar dados
+    }, err=>{
+      console.warn("Leaderboard subscribe error:", err);
+      Online.ready = false; Online.status = "offline";
+      renderDash();
+    });
+}
 // ====== Helpers ======
 function todayKey(){const d=new Date();return d.getFullYear()+"-"+String(d.getMonth()+1).padStart(2,"0")+"-"+String(d.getDate()).padStart(2,"0")}
 function mondayOfThisWeekISO(){const d=new Date();const day=d.getDay();const diff=(day===0?-6:1-day);const m=new Date(d);m.setDate(d.getDate()+diff);return m.toISOString().slice(0,10)}
 function currentLevel(){let L=LEVELS[0];for(const lv of LEVELS){if(S.xp>=lv.minXP)L=lv}S.levelId=L.id;return L}
-function addXP(v){S.xp+=v;toast("+"+v+" "+t("xp"));try{ if(Settings.sound) document.getElementById("audioWin").play().catch(()=>{}) }catch(e){}; if(Settings.confetti){confetti({particleCount:120,spread:65,origin:{y:.6}})} renderDash(); save();}
+function addXP(v){S.xp+=v;toast("+"+v+" "+t("xp"));try{ if(Settings.sound) document.getElementById("audioWin").play().catch(()=>{}) }catch(e){}; if(Settings.confetti){confetti({particleCount:120,spread:65,origin:{y:.6}})} save(); onlineUpsertScore(); renderDash();}
 function toast(msg){const tEl=document.getElementById("toast");tEl.textContent=msg;tEl.style.display="block";setTimeout(()=>tEl.style.display="none",1800)}
 
 // ====== Render ======
@@ -339,7 +428,60 @@ function renderDash(){
   });
   document.querySelectorAll('[data-mod]').forEach(b=>b.onclick=(e)=>{startQuiz(+e.currentTarget.getAttribute('data-mod'))});
 
-  applyI18n();
+  
+  // Render ranking (online se disponível, senão local) + medalhas + barra
+  const rankDiv = document.getElementById("rankList");
+  if (rankDiv) {
+    // Header status
+    updateRankHeader();
+    // Refresh button
+    rankDiv.innerHTML = "";
+    const btn = document.createElement("button");
+    btn.className = "btn ghost";
+    btn.style.marginBottom = "8px";
+    btn.textContent = (lang==='en'?'Refresh ranking':'Atualizar ranking');
+    btn.onclick = ()=>{ if (Online.enabled){ onlineSubscribeLeaderboard(20);} renderDash(); };
+    rankDiv.appendChild(btn);
+
+    const data = (Online.enabled && Online.ready && Online.last.length) ? Online.last : (S.rank || []);
+    if (!data.length) {
+      const item = document.createElement("div");
+      item.className = "meta";
+      item.textContent = (Online.enabled? (lang==='en'?'Loading ranking...':'Carregando ranking...') : (lang==='en'?'No ranking data':'Sem dados de ranking.'));
+      rankDiv.appendChild(item);
+    } else {
+      data.slice(0,20).forEach((r,i)=>{
+        const item = document.createElement("div");
+        item.className = "mod";
+        item.style.display = "flex";
+        item.style.flexDirection = "column";
+        const name = r.name || "Jogador";
+        const xp = r.xp || 0;
+
+        // Medalha para top 3
+        const medal = i===0?'🥇':(i===1?'🥈':(i===2?'🥉':'#'+(i+1)));
+        // Estimar nível por XP
+        let Lname='Técnico', Lmin=0, Lnext=1000, Licon='👷';
+        try{
+          let Ltmp = LEVELS[0];
+          for (const lv of LEVELS){ if (xp>=lv.minXP) Ltmp = lv; }
+          Lname = Ltmp.name; Lmin = Ltmp.minXP; Lnext = isFinite(Ltmp.nextXP)?Ltmp.nextXP:(xp||1);
+          Licon = (Lname==='Técnico'?'👷':Lname==='Analista'?'👨‍💻':Lname==='Especialista'?'👨‍🔧':Lname==='Gerente/Diretor'?'👔':'🔮');
+        }catch(e){/* noop */}
+        const pct = Math.max(0, Math.min(100, (100*(xp - Lmin)/((Lnext - Lmin)||1))));
+
+        item.innerHTML = `
+          <div style="display:flex;justify-content:space-between;align-items:center;width:100%">
+            <div><b>${medal}</b> ${Licon} ${name} <span class="meta">(${Lname})</span></div>
+            <div class="meta">${xp} XP</div>
+          </div>
+          <div class="xpbar" style="margin-top:6px"><i style="width:${pct}%"></i></div>
+        `;
+        rankDiv.appendChild(item);
+      });
+    }
+  }
+applyI18n();
 }
 
 // ====== Login ======
@@ -348,7 +490,7 @@ function doLogin(){
   S.name=name;S.levelId="Tecnico";
   const tk=todayKey();
   if(S.lastLoginDay!==tk){S.streak=(S.lastLoginDay && ((new Date(tk)-new Date(S.lastLoginDay))===86400000))?(S.streak+1):1;S.lastLoginDay=tk}
-  save();
+  save(); OnlineInit(); onlineUpsertScore();
   // hide brand + login, show top bar + dash
   document.getElementById("brandLogin").classList.add("hidden");
   document.getElementById("viewLogin").classList.add("hidden");
@@ -407,7 +549,7 @@ document.getElementById("btnReset").onclick=()=>{
 // ====== Init ======
 applyTheme();
 applyI18n();
-if(S.name){
+if(S.name){ OnlineInit(); onlineUpsertScore();
   document.getElementById("brandLogin").classList.add("hidden");
   document.getElementById("viewLogin").classList.add("hidden");
   document.getElementById("topBar").classList.remove("hidden");
